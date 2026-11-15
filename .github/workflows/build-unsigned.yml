@@ -88,6 +88,53 @@ jobs:
         run: |
           sed -i '' 's/minimum_os_version = "[^"]*"/minimum_os_version = "15.0"/g' Telegram/BUILD
 
+      # Фиктивные профили в репозитории истекли 30.10.2026, и сборка их отвергает.
+      # Продлеваем срок и переподписываем профили тем же самоподписанным сертификатом.
+      - name: Renew expired fake provisioning profiles
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime, os, plistlib, subprocess, sys, tempfile
+          sys.path.insert(0, "build-system/Make")
+          import GenerateProfiles as gp
+
+          p12 = "build-system/fake-codesigning/certs/SelfSigned.p12"
+          profiles = "build-system/fake-codesigning/profiles"
+          new_date = datetime.datetime(2030, 10, 1)
+
+          identity = None
+          try:
+              identity = gp.get_signing_identity_from_p12(p12, "")
+          except Exception as error:
+              print("could not read the identity from the p12:", error)
+          if not identity:
+              identity = "Apple Distribution: Telegram FZ-LLC (C67CF9S4VU)"
+          print("Signing identity:", identity)
+
+          keychain = gp.setup_temp_keychain(p12, "")
+          try:
+              for name in sorted(os.listdir(profiles)):
+                  if not name.endswith(".mobileprovision"):
+                      continue
+                  path = os.path.join(profiles, name)
+                  data = plistlib.loads(subprocess.check_output(["security", "cms", "-D", "-i", path]))
+                  old_date = data.get("ExpirationDate")
+                  data["ExpirationDate"] = new_date
+                  data.pop("DER-Encoded-Profile", None)
+                  with tempfile.NamedTemporaryFile(suffix=".plist", delete=False) as file:
+                      plistlib.dump(data, file)
+                      plain = file.name
+                  signed = path + ".new"
+                  subprocess.check_call(["security", "cms", "-S", "-k", keychain, "-N", identity, "-i", plain, "-o", signed])
+                  os.unlink(plain)
+                  os.replace(signed, path)
+                  check = plistlib.loads(subprocess.check_output(["security", "cms", "-D", "-i", path]))
+                  print(name, old_date, "->", check["ExpirationDate"])
+                  assert check["ExpirationDate"] > datetime.datetime(2027, 1, 1)
+          finally:
+              gp.cleanup_temp_keychain(keychain)
+          PY
+
       - name: Build (release_arm64, fake codesigning)
         run: |
           set -euo pipefail
