@@ -1,0 +1,118 @@
+name: Unsigned IPA (fork)
+
+# Сборка неподписанного IPA в форке без аккаунта Apple Developer.
+# Запуск: вкладка Actions -> "Unsigned IPA (fork)" -> Run workflow.
+#
+# Нужные секреты репозитория (Settings -> Secrets and variables -> Actions):
+#   TELEGRAM_API_ID, TELEGRAM_API_HASH - свои данные с https://my.telegram.org
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 300
+    env:
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Select pinned Xcode
+        id: xcode
+        run: |
+          set -euo pipefail
+          XCODE_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')"
+          XCODE_PATH="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          test -d "$XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+          echo "build=$(xcodebuild -version | awk '/^Build version / {print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Metal toolchain
+        run: |
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun --find metal
+
+      - name: Cache Bazel disk cache
+        uses: actions/cache@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-disk-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.build }}-${{ hashFiles('versions.json', 'MODULE.bazel.lock') }}
+          restore-keys: bazel-disk-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.build }}-
+
+      - name: Version and build number
+        run: |
+          set -euo pipefail
+          APP_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["app"])')"
+          BUILD_NUMBER="$(( $(git rev-list --count HEAD) + $(cat build_number_offset) ))"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+      # Берём конфигурацию, под которую сделаны профили fake-codesigning,
+      # и подставляем в неё свои api_id / api_hash.
+      - name: Write build configuration
+        run: |
+          set -euo pipefail
+          : "${TELEGRAM_API_ID:?добавьте секрет TELEGRAM_API_ID}" "${TELEGRAM_API_HASH:?добавьте секрет TELEGRAM_API_HASH}"
+          mkdir -p build-input
+          python3 - <<'PY'
+          import json, os
+          config = json.load(open("build-system/appstore-configuration.json"))
+          config["api_id"] = os.environ["TELEGRAM_API_ID"]
+          config["api_hash"] = os.environ["TELEGRAM_API_HASH"]
+          json.dump(config, open("build-input/fork-configuration.json", "w"), indent=4)
+          PY
+
+      - name: Write local.bazelrc (Xcode 27 compatibility)
+        run: |
+          cat > local.bazelrc <<'RC'
+          build --features=no_include_scanning
+          build --host_features=no_include_scanning
+          build --copt=-Wno-error
+          build --cxxopt=-Wno-error
+          build --objccopt=-Wno-error
+          build --per_file_copt=.*\.m$@-Wno-error=deprecated-declarations
+          build --per_file_copt=.*\.mm$@-Wno-error=deprecated-declarations
+          build --@build_bazel_rules_swift//swift:copt=-no-warnings-as-errors
+          RC
+
+      - name: Force iOS 15 deployment target
+        run: |
+          sed -i '' 's/minimum_os_version = "[^"]*"/minimum_os_version = "15.0"/g' Telegram/BUILD
+
+      - name: Build (release_arm64, fake codesigning)
+        run: |
+          set -euo pipefail
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          python3 -u build-system/Make/Make.py \
+            --cacheDir "$HOME/telegram-bazel-cache" \
+            build \
+            --configurationPath build-input/fork-configuration.json \
+            --codesigningInformationPath build-system/fake-codesigning \
+            --buildNumber="$BUILD_NUMBER" \
+            --configuration=release_arm64 \
+            --outputBuildArtifactsPath build/artifacts
+
+      - name: Remove the signature
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          scripts/ci-unsigned-ipa.sh bazel-bin/Telegram/Telegram.ipa \
+            "$RUNNER_TEMP/out/Nagram-$APP_VERSION-$BUILD_NUMBER-unsigned.ipa"
+          ls -l "$RUNNER_TEMP/out"
+
+      - name: Upload the unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nagram-unsigned-${{ env.BUILD_NUMBER }}
+          path: ${{ runner.temp }}/out/*.ipa
+          if-no-files-found: error
+          retention-days: 14
